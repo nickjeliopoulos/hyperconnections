@@ -143,7 +143,7 @@ class AttentionHyperConnections(nn.Module):
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         # x: [B, *, input_dim]
-        shape = x.shape
+        leading = x.shape[:-1]
         x = x.reshape(-1, self.n, self.block_size)  # [B*, n, block_size]
         B = x.shape[0]
 
@@ -154,7 +154,7 @@ class AttentionHyperConnections(nn.Module):
         x_read_in = einsum(read_in, x, "b m n, b n d -> b m d")  # [B*, m, block_size]
 
         # Process through the backbone module
-        out = self.module(x_read_in.reshape(*shape[:-1], self.embed_dim), **kwargs)
+        out = self.module(x_read_in.reshape(*leading, self.embed_dim), **kwargs)
 
         # Write out from backbone width back to the over-width space
         out = out.reshape(B, self.m, self.block_size)  # [B*, m, block_size]
@@ -165,4 +165,4 @@ class AttentionHyperConnections(nn.Module):
         x = self.attn(x) # [B*, n, block_size]
 
         out = out + x  # [B*, n, block_size]
-        return out.reshape(shape)
+        return out.unflatten(0, leading).flatten(-2)

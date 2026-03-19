@@ -209,7 +209,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         # x: [B, *, input_dim]
-        shape = x.shape
+        leading = x.shape[:-1]
         x = x.reshape(-1, self.n, self.block_size)  # [B*, n, block_size]
         B = x.shape[0]
 
@@ -220,7 +220,7 @@ class ContinuousGenHyperConnections(nn.Module):
         x_read = einsum(read_in, x, "b m n, b n d -> b m d")  # [B*, m, block_size]
 
         # Process through the backbone module
-        out = self.module(x_read.reshape(*shape[:-1], self.embed_dim), **kwargs)
+        out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
 
         # Write out from backbone width back to the over-width space
         out = out.reshape(B, self.m, self.block_size)
@@ -242,4 +242,4 @@ class ContinuousGenHyperConnections(nn.Module):
             x_orth = einsum(orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d")  # [b, n, block_size]
             x_mixed = x_proj + einsum(transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
 
-        return (x_mixed + Y).reshape(shape)
+        return (x_mixed + Y).unflatten(0, leading).flatten(-2)
