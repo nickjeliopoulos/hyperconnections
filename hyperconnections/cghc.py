@@ -157,7 +157,7 @@ class ContinuousGenHyperConnections(nn.Module):
         """
         B = x.shape[0]
         x_norm = self.norm(x.view(B, -1)).float()  # [B, input_dim], float32 for linear stability
-        A = torch.zeros(B, self.n, self.n, device=x.device, dtype=x.dtype)
+        A = torch.zeros(B, self.n, self.n, device=x.device, dtype=torch.float32)  # float32 to match x_norm computations
 
         if hasattr(self, "conserv_A"):
             M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
@@ -242,7 +242,7 @@ class ContinuousGenHyperConnections(nn.Module):
             x_mixed = einsum(transition_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
         else:
             proj_matrix = einsum(projection_dir, projection_dir, "b n1, b n2 -> b n1 n2")  # [b, n, n]
-            orthogonal_proj = torch.eye(self.n, device=x.device) - proj_matrix  # [b, n, n]
+            orthogonal_proj = torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix  # [b, n, n]
             x_proj = einsum(proj_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [b, n, block_size]
             x_orth = einsum(orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d")  # [b, n, block_size]
             x_mixed = x_proj + einsum(transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
