@@ -156,7 +156,7 @@ class ContinuousGenHyperConnections(nn.Module):
         Dynamic deltas are zero-init so A starts from the static base alone.
         """
         B = x.shape[0]
-        x_norm = self.norm(x.view(B, -1))  # [B, input_dim]
+        x_norm = self.norm(x.view(B, -1)).float()  # [B, input_dim], float32 for linear stability
         A = torch.zeros(B, self.n, self.n, device=x.device, dtype=x.dtype)
 
         if hasattr(self, "conserv_A"):
@@ -182,7 +182,7 @@ class ContinuousGenHyperConnections(nn.Module):
         """Compute dynamic read/write weights from the current stream state."""
         B = x.shape[0]
         x_flat = x.view(B, -1)  # [B, input_dim]
-        x_norm = self.norm(x_flat)
+        x_norm = self.norm(x_flat).float()  # float32 for linear layers under torch.compile
 
         h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)
         h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)
@@ -202,7 +202,7 @@ class ContinuousGenHyperConnections(nn.Module):
         elif self.projection == "v":
             B = x.shape[0]
             x_flat = x.view(B, -1)
-            v = self.projection_dir(self.norm(x_flat))  # [B, n]
+            v = self.projection_dir(self.norm(x_flat).float())  # [B, n]
             return F.normalize(v, dim=-1)  # [B, n], unit norm
         else:
             return None

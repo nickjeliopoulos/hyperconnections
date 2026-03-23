@@ -101,7 +101,7 @@ class ManifoldHyperConnections(nn.Module):
     def compute_mixing_weights(self, x: torch.Tensor):
         B = x.shape[0]
         x_flat = x.view(B, -1)   # [B, input_dim] — flatten all streams
-        x_norm = self.norm(x_flat)
+        x_norm = self.norm(x_flat).float()  # float32 for linear layers under torch.compile
 
         h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)         # [B, n, m]
         h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)     # [B, n, m]
