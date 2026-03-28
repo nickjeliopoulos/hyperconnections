@@ -8,22 +8,6 @@ import torch.nn.functional as F
 from einops import einsum
 
 
-@dataclass
-class ContinuousHCConfig:
-    n_streams: int
-    d_model: int
-    dt: float = 1.0
-    generator_type: Literal[
-        "conservative",
-        "diffusion_psd",
-        "diagonal_dissipative",
-        "conservative_dissipative",
-    ] = "conservative_dissipative"
-    protection_mode: Literal["none", "mean", "v"] = "none"
-    eps: float = 1e-5
-    learn_dt: bool = False
-
-
 class ContinuousGenHyperConnections(nn.Module):
     def __init__(
         self,
@@ -37,8 +21,10 @@ class ContinuousGenHyperConnections(nn.Module):
             "conservative",
             "psd_diss",
             "diagonal_diss",
+            "laplacian",
             "conservative_diag_diss",
             "conservative_psd_diss",
+            "conservative_laplacian",
         ] = "conservative_psd_diss",
         projection: Literal["mean", "v", "none"] = "none",
         learn_dt: bool = False,
@@ -85,9 +71,11 @@ class ContinuousGenHyperConnections(nn.Module):
             "conservative",
             "conservative_diag_diss",
             "conservative_psd_diss",
+            "conservative_laplacian",
         }
         psd_diss = generator_type in {"psd_diss", "conservative_psd_diss"}
         diag_diss = generator_type in {"diagonal_diss", "conservative_diag_diss"}
+        laplacian = generator_type in {"laplacian", "conservative_laplacian"}
 
         if conserv:
             self.conserv_A = nn.Parameter(torch.eye(n, n))
@@ -100,6 +88,12 @@ class ContinuousGenHyperConnections(nn.Module):
             # Initialise so softplus(diss_diag) ≈ 0.007 → Phi ≈ I at start
             self.diss_diag = nn.Parameter(torch.full((n,), -5.0))
             self.diss_pred = nn.Linear(input_dim, n, bias=True)
+        if laplacian:
+            self.laplacian_A = nn.Parameter(torch.zeros(n, n))
+            self.laplacian_q = nn.Linear(self.block_size, self.block_size, bias=True)
+            self.laplacian_k = nn.Linear(self.block_size, self.block_size, bias=True)
+            self.laplacian_scale = self.block_size**-0.5
+            self.norm_lap = nn.RMSNorm(self.block_size, elementwise_affine=True)
 
         # Projection Direction
         if projection == "mean":
@@ -135,6 +129,13 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "diss_diag"):
             nn.init.zeros_(self.diss_pred.weight)
             nn.init.zeros_(self.diss_pred.bias)
+        
+        if hasattr(self, "laplacian_A"):
+            nn.init.zeros_(self.laplacian_A)
+            nn.init.zeros_(self.laplacian_q.weight)
+            nn.init.zeros_(self.laplacian_q.bias)
+            nn.init.zeros_(self.laplacian_k.weight)
+            nn.init.zeros_(self.laplacian_k.bias)
 
         # Projections: zero so initial behaviour matches static biases
         for proj in (self.proj_read_in, self.proj_write_out):
@@ -156,8 +157,12 @@ class ContinuousGenHyperConnections(nn.Module):
         Dynamic deltas are zero-init so A starts from the static base alone.
         """
         B = x.shape[0]
+        if hasattr(self, "laplacian_A"):
+            x_lap_norm = self.norm_lap(x)
         x_norm = self.norm(x.view(B, -1))  # [B, input_dim]
-        A = torch.zeros(B, self.n, self.n, device=x.device, dtype=x.dtype)  # match input dtype
+        A = torch.zeros(
+            B, self.n, self.n, device=x.device, dtype=x.dtype
+        )  # match input dtype
 
         if hasattr(self, "conserv_A"):
             M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
@@ -171,6 +176,18 @@ class ContinuousGenHyperConnections(nn.Module):
             d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
             A = A - torch.diag_embed(d)
 
+        if hasattr(self, "laplacian_A"):
+            score_bias = self.laplacian_A
+            lap_q = self.laplacian_q(x_lap_norm) # [B, n, block_size]
+            lap_k = self.laplacian_k(x_lap_norm) # [B, n, block_size]
+            scores = lap_q @ lap_k.transpose(-1, -2) * self.laplacian_scale
+            scores = score_bias + scores
+            scores = 0.5 * (scores + scores.transpose(-1, -2)) # symmetrize
+            adjacency = F.softplus(scores) - math.log(2)  # shift so zero scores → zero adjacency
+            adjacency = adjacency - torch.diag_embed(torch.diagonal(adjacency, dim1=-2, dim2=-1))
+            degree = torch.diag_embed(adjacency.sum(dim=-1))
+            laplacian = degree - adjacency
+            A = A - laplacian
         return A
 
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
@@ -187,15 +204,15 @@ class ContinuousGenHyperConnections(nn.Module):
         h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)
         h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)
 
-        read_in = F.sigmoid(self.alpha_read_in * h_read_in + self.read_in).transpose(
+        read_in = torch.sigmoid(self.alpha_read_in * h_read_in + self.read_in).transpose(
             1, 2
         )  # [B, m, n]
-        write_out = 2 * F.sigmoid(
+        write_out = 2 * torch.sigmoid(
             self.alpha_write_out * h_write_out + self.write_out
         )  # [B, n, m]
 
         return write_out, read_in
-    
+
     def compute_projection(self, x: torch.Tensor):
         if self.projection == "mean":
             return self.projection_dir.unsqueeze(0)  # [1, n]
@@ -231,15 +248,27 @@ class ContinuousGenHyperConnections(nn.Module):
         transition_matrix = self.compute_transition(x)  # [B, n, n]
 
         # compute projection direction for projected mixing
-        projection_dir = self.compute_projection(x) # [B, n] or None
+        projection_dir = self.compute_projection(x)  # [B, n] or None
 
         if projection_dir is None:
-            x_mixed = einsum(transition_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
+            x_mixed = einsum(
+                transition_matrix, x, "b n1 n2, b n2 d -> b n1 d"
+            )  # [B*, n, block_size]
         else:
-            proj_matrix = einsum(projection_dir, projection_dir, "b n1, b n2 -> b n1 n2")  # [b, n, n]
-            orthogonal_proj = torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix  # [b, n, n]
-            x_proj = einsum(proj_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [b, n, block_size]
-            x_orth = einsum(orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d")  # [b, n, block_size]
-            x_mixed = x_proj + einsum(transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
+            proj_matrix = einsum(
+                projection_dir, projection_dir, "b n1, b n2 -> b n1 n2"
+            )  # [b, n, n]
+            orthogonal_proj = (
+                torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
+            )  # [b, n, n]
+            x_proj = einsum(
+                proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
+            )  # [b, n, block_size]
+            x_orth = einsum(
+                orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d"
+            )  # [b, n, block_size]
+            x_mixed = x_proj + einsum(
+                transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
+            )  # [B*, n, block_size]
 
         return (x_mixed + Y).unflatten(0, leading).flatten(-2)
