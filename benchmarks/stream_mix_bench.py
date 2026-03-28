@@ -9,7 +9,7 @@ Usage
 # Only correctness:
     python benchmarks/stream_mix_bench.py --mode correctness
 
-# Only performance:
+# Only performance (random + structured):
     python benchmarks/stream_mix_bench.py --mode perf
 
 # Restrict to specific N values:
@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from itertools import product
 from typing import Sequence
 
@@ -87,6 +86,47 @@ def _make_v(B, N, dtype, seed=7):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Structured Phi factories
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _make_skew_phi(B: int, N: int, dtype: torch.dtype, seed: int = 1) -> torch.Tensor:
+    """Skew-symmetric: Phi = M - M^T  (Phi^T = -Phi)."""
+    torch.manual_seed(seed)
+    M = torch.randn(B, N, N, device=DEVICE, dtype=dtype) / N ** 0.5
+    return M - M.mT
+
+
+def _make_psd_phi(B: int, N: int, dtype: torch.dtype, seed: int = 2) -> torch.Tensor:
+    """Symmetric positive semi-definite: Phi = R @ R^T."""
+    torch.manual_seed(seed)
+    R = torch.randn(B, N, N, device=DEVICE, dtype=dtype) / N ** 0.5
+    return R @ R.mT
+
+
+def _make_diag_phi(B: int, N: int, dtype: torch.dtype, seed: int = 3) -> torch.Tensor:
+    """Diagonal: Phi = diag(d), d ~ N(0,1)."""
+    torch.manual_seed(seed)
+    d = torch.randn(B, N, device=DEVICE, dtype=dtype)
+    return torch.diag_embed(d)
+
+
+# Maps a short name to a factory (B, N, dtype) -> Phi
+_PHI_FACTORIES = {
+    "random":   lambda B, N, dt: _make(B, N, 1, dt, seed=0)[0],  # D unused
+    "skew_sym": _make_skew_phi,
+    "psd":      _make_psd_phi,
+    "diagonal": _make_diag_phi,
+}
+
+_PHI_LABEL = {
+    "random":   "rand",
+    "skew_sym": "skew",
+    "psd":      "psd ",
+    "diagonal": "diag",
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Reference implementations
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -94,10 +134,22 @@ def ref_no_proj(Phi, x, Y):
     return torch.bmm(Phi, x) + Y
 
 
+def ref_diagonal_add(Phi, x, Y):
+    """Structure-aware O(ND) baseline for diagonal Phi (vs O(N²D) bmm)."""
+    d = torch.diagonal(Phi, dim1=-2, dim2=-1)   # [B, N]
+    return d.unsqueeze(-1) * x + Y
+
+
 def ref_proj(Phi, x, Y, v):
     alpha = torch.einsum("bn, bnd -> bd", v, x)
     Phi_v = torch.bmm(Phi, v.unsqueeze(-1)).squeeze(-1)
     return torch.bmm(Phi, x) + (v - Phi_v).unsqueeze(2) * alpha.unsqueeze(1) + Y
+
+
+# torch.compile baselines — compiled once at import time.
+# mode="reduce-overhead" enables CUDA graph capture and op fusion.
+_ref_no_proj_compiled = torch.compile(ref_no_proj, mode="reduce-overhead")
+_ref_proj_compiled    = torch.compile(ref_proj,    mode="reduce-overhead")
 
 
 def ref_proj_backward(Phi, x, Y, v):
@@ -139,11 +191,65 @@ def _corr_row(config, variant, check, max_err, atol, passed):
     return f"{config:>30}  {variant:>12}  {check:>10}  {max_err:>10.2e}  {atol:>8.0e}  {result}"
 
 
+def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
+    """Run fwd+bwd correctness for one (Phi, x, Y, v) combo; return updated all_passed."""
+
+    # ---- forward no-proj ----
+    got = stream_mix_add(Phi, x, Y)
+    ref = ref_no_proj(Phi.float(), x.float(), Y.float()).to(dtype)
+    passed, err = _check("", got, ref, atol_f)
+    all_passed &= passed
+    print(_corr_row(cfg_str, "no-proj", "fwd", err, atol_f, passed))
+
+    # ---- forward proj ----
+    got = stream_mix_add(Phi, x, Y, v=v)
+    ref = ref_proj(Phi.float(), x.float(), Y.float(), v.float()).to(dtype)
+    passed, err = _check("", got, ref, atol_f)
+    all_passed &= passed
+    print(_corr_row(cfg_str, "proj", "fwd", err, atol_f, passed))
+
+    # backward only for fp32 (avoids casting complexity in reference)
+    if dtype == torch.float32:
+        # ---- backward no-proj ----
+        Phi_t = Phi.detach().requires_grad_(True)
+        x_t   = x.detach().requires_grad_(True)
+        Y_t   = Y.detach().requires_grad_(True)
+        stream_mix_add(Phi_t, x_t, Y_t).sum().backward()
+        gP_r, gx_r, gY_r = ref_no_proj_backward(Phi, x, Y)
+
+        for name, got_g, ref_g in [
+            ("grad_Phi", Phi_t.grad, gP_r),
+            ("grad_x",   x_t.grad,   gx_r),
+            ("grad_Y",   Y_t.grad,   gY_r),
+        ]:
+            passed, err = _check("", got_g, ref_g, atol_b)
+            all_passed &= passed
+            print(_corr_row(cfg_str, "no-proj", name, err, atol_b, passed))
+
+        # ---- backward proj ----
+        Phi_t = Phi.detach().requires_grad_(True)
+        x_t   = x.detach().requires_grad_(True)
+        Y_t   = Y.detach().requires_grad_(True)
+        stream_mix_add(Phi_t, x_t, Y_t, v=v).sum().backward()
+        gP_r, gx_r, gY_r = ref_proj_backward(Phi, x, Y, v)
+
+        for name, got_g, ref_g in [
+            ("grad_Phi", Phi_t.grad, gP_r),
+            ("grad_x",   x_t.grad,   gx_r),
+            ("grad_Y",   Y_t.grad,   gY_r),
+        ]:
+            passed, err = _check("", got_g, ref_g, atol_b)
+            all_passed &= passed
+            print(_corr_row(cfg_str, "proj", name, err, atol_b, passed))
+
+    return all_passed
+
+
 def run_correctness(ns: Sequence[int], dtypes: Sequence[str]):
     """Run forward + backward correctness checks and print a summary table."""
     print()
     print(bold("=" * 90))
-    print(bold("  CORRECTNESS"))
+    print(bold("  CORRECTNESS — random Phi"))
     print(bold("=" * 90))
     print(_CORR_HDR)
     print(_CORR_SEP)
@@ -153,14 +259,12 @@ def run_correctness(ns: Sequence[int], dtypes: Sequence[str]):
         ns,                # N
         [64, 128, 256],    # D
     ))
-    # Add one non-power-of-2 D to test masking
-    configs += [(4, ns[0], 100)]
+    configs += [(4, ns[0], 100)]   # non-power-of-2 D to test masking
 
     all_passed = True
 
     for dtype_name in dtypes:
         dtype  = _dtype(dtype_name)
-        # fp16 tolerances are looser (kernel accumulates in fp32 but stores in fp16)
         atol_f = 1e-3 if dtype == torch.float32 else 2e-2
         atol_b = 2e-3 if dtype == torch.float32 else 4e-2
 
@@ -168,57 +272,35 @@ def run_correctness(ns: Sequence[int], dtypes: Sequence[str]):
             Phi, x, Y = _make(B, N, D, dtype)
             v = _make_v(B, N, dtype)
             cfg_str = f"B={B} N={N} D={D} {dtype_name}"
-
-            # ---- forward no-proj ----
-            got = stream_mix_add(Phi, x, Y)
-            ref = ref_no_proj(Phi.float(), x.float(), Y.float()).to(dtype)
-            passed, err = _check("", got, ref, atol_f)
-            all_passed &= passed
-            print(_corr_row(cfg_str, "no-proj", "fwd", err, atol_f, passed))
-
-            # ---- forward proj ----
-            got = stream_mix_add(Phi, x, Y, v=v)
-            ref = ref_proj(Phi.float(), x.float(), Y.float(), v.float()).to(dtype)
-            passed, err = _check("", got, ref, atol_f)
-            all_passed &= passed
-            print(_corr_row(cfg_str, "proj", "fwd", err, atol_f, passed))
-
-            # backward only for fp32 (avoids casting complexity in reference)
-            if dtype == torch.float32:
-                # ---- backward no-proj ----
-                Phi_t = Phi.detach().requires_grad_(True)
-                x_t   = x.detach().requires_grad_(True)
-                Y_t   = Y.detach().requires_grad_(True)
-                stream_mix_add(Phi_t, x_t, Y_t).sum().backward()
-                gP_r, gx_r, gY_r = ref_no_proj_backward(Phi, x, Y)
-
-                for name, got_g, ref_g in [
-                    ("grad_Phi", Phi_t.grad, gP_r),
-                    ("grad_x",   x_t.grad,   gx_r),
-                    ("grad_Y",   Y_t.grad,   gY_r),
-                ]:
-                    passed, err = _check("", got_g, ref_g, atol_b)
-                    all_passed &= passed
-                    print(_corr_row(cfg_str, "no-proj", name, err, atol_b, passed))
-
-                # ---- backward proj ----
-                Phi_t = Phi.detach().requires_grad_(True)
-                x_t   = x.detach().requires_grad_(True)
-                Y_t   = Y.detach().requires_grad_(True)
-                stream_mix_add(Phi_t, x_t, Y_t, v=v).sum().backward()
-                gP_r, gx_r, gY_r = ref_proj_backward(Phi, x, Y, v)
-
-                for name, got_g, ref_g in [
-                    ("grad_Phi", Phi_t.grad, gP_r),
-                    ("grad_x",   x_t.grad,   gx_r),
-                    ("grad_Y",   Y_t.grad,   gY_r),
-                ]:
-                    passed, err = _check("", got_g, ref_g, atol_b)
-                    all_passed &= passed
-                    print(_corr_row(cfg_str, "proj", name, err, atol_b, passed))
+            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
 
         print(_CORR_SEP)
 
+    # ── Structured Phi correctness ───────────────────────────────────────────
+    # Focused config set to keep the table concise.
+    print()
+    print(bold("=" * 90))
+    print(bold("  CORRECTNESS — structured Phi  (fp32 only)"))
+    print(bold("=" * 90))
+    print(_CORR_HDR)
+    print(_CORR_SEP)
+
+    struct_configs = list(product([128, 1024], ns, [64, 256]))
+    dtype = torch.float32
+    atol_f, atol_b = 1e-3, 2e-3
+
+    for phi_type, (B, N, D) in product(
+        ["skew_sym", "psd", "diagonal"], struct_configs
+    ):
+        factory = _PHI_FACTORIES[phi_type]
+        # Generate Phi with appropriate structure; x, Y are always random
+        _, x, Y = _make(B, N, D, dtype, seed=42)
+        Phi = factory(B, N, dtype).contiguous()
+        v   = _make_v(B, N, dtype)
+        cfg_str = f"[{_PHI_LABEL[phi_type]}] B={B} N={N} D={D}"
+        all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
+
+    print(_CORR_SEP)
     print()
     if all_passed:
         print(ok("All correctness checks passed."))
@@ -244,18 +326,21 @@ def _bytes_proj(B, N, D, elem_bytes):
 
 _PERF_HDR = (
     f"{'Config':>30}  {'Variant':>12}  {'dtype':>6}  "
-    f"{'Triton ms':>10}  {'PyTorch ms':>11}  {'Speedup':>8}  {'BW GB/s':>9}"
+    f"{'Triton ms':>10}  {'Eager ms':>9}  {'Compiled ms':>12}  "
+    f"{'vs Eager':>9}  {'vs Cmp':>7}  {'BW GB/s':>9}"
 )
-_PERF_SEP = "-" * 100
+_PERF_SEP = "-" * 120
 
 
-def _perf_row(config, variant, dtype_name, t_tri, t_ref, bw_gbs):
-    speedup = t_ref / t_tri
-    sp_str = f"{speedup:.2f}x"
-    sp_col = ok(sp_str) if speedup >= 1.05 else (warn(sp_str) if speedup >= 0.95 else fail(sp_str))
+def _perf_row(config, variant, dtype_name, t_tri, t_eager, t_compiled, bw_gbs):
+    def _sp(t_ref):
+        sp = t_ref / t_tri
+        s = f"{sp:.2f}x"
+        return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
     return (
         f"{config:>30}  {variant:>12}  {dtype_name:>6}  "
-        f"{t_tri:>10.3f}  {t_ref:>11.3f}  {sp_col:>8}  {bw_gbs:>9.1f}"
+        f"{t_tri:>10.3f}  {t_eager:>9.3f}  {t_compiled:>12.3f}  "
+        f"{_sp(t_eager):>9}  {_sp(t_compiled):>7}  {bw_gbs:>9.1f}"
     )
 
 
@@ -286,27 +371,131 @@ def run_perf(ns: Sequence[int], dtypes: Sequence[str], warmup: int = 25, rep: in
                 lambda: stream_mix_add(Phi, x, Y),
                 warmup=warmup, rep=rep,
             )
-            t_ref = triton.testing.do_bench(
+            t_eager = triton.testing.do_bench(
                 lambda: ref_no_proj(Phi, x, Y),
                 warmup=warmup, rep=rep,
             )
+            t_compiled = triton.testing.do_bench(
+                lambda: _ref_no_proj_compiled(Phi, x, Y),
+                warmup=warmup, rep=rep,
+            )
             bw = _bytes_no_proj(B, N, D, elem) / (t_tri * 1e-3) / 1e9
-            print(_perf_row(cfg_str, "no-proj", dtype_name, t_tri, t_ref, bw))
+            print(_perf_row(cfg_str, "no-proj", dtype_name, t_tri, t_eager, t_compiled, bw))
 
             # ---- proj ----
             t_tri_p = triton.testing.do_bench(
                 lambda: stream_mix_add(Phi, x, Y, v=v),
                 warmup=warmup, rep=rep,
             )
-            # Reference: the full PyTorch projected computation
-            t_ref_p = triton.testing.do_bench(
+            t_eager_p = triton.testing.do_bench(
                 lambda: ref_proj(Phi, x, Y, v),
                 warmup=warmup, rep=rep,
             )
+            t_compiled_p = triton.testing.do_bench(
+                lambda: _ref_proj_compiled(Phi, x, Y, v),
+                warmup=warmup, rep=rep,
+            )
             bw_p = _bytes_proj(B, N, D, elem) / (t_tri_p * 1e-3) / 1e9
-            print(_perf_row(cfg_str, "proj", dtype_name, t_tri_p, t_ref_p, bw_p))
+            print(_perf_row(cfg_str, "proj", dtype_name, t_tri_p, t_eager_p, t_compiled_p, bw_p))
 
         print(_PERF_SEP)
+
+    print()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Structured-matrix performance benchmark
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SPHDR = (
+    f"{'Config':>24}  {'PhiType':>8}  {'dtype':>6}  "
+    f"{'Triton ms':>10}  {'Eager ms':>9}  {'Compiled ms':>12}  {'Speedup':>8}  "
+    f"{'Diag-fast ms':>13}  {'vs Diag':>8}"
+)
+_SPSEP = "-" * 125
+
+
+def run_structured_perf(
+    ns: Sequence[int],
+    dtypes: Sequence[str],
+    warmup: int = 25,
+    rep: int = 200,
+):
+    """Benchmark all four Phi structures.
+
+    For diagonal Phi an additional structure-aware PyTorch baseline is shown:
+      ref_diagonal_add  uses  d * x + Y  (O(ND) vs O(N²D)), revealing the
+      overhead of loading the full Phi matrix in the Triton kernel.
+    """
+    print()
+    print(bold("=" * 110))
+    print(bold("  STRUCTURED-MATRIX PERFORMANCE"))
+    print(bold("=" * 110))
+    print(_SPHDR)
+    print(_SPSEP)
+
+    # Representative configs — one per (N, B, D) combination
+    B_vals = [512, 2048, 8192]
+    D_vals = [128, 512]
+
+    phi_types = list(_PHI_FACTORIES.keys())   # random, skew_sym, psd, diagonal
+
+    for dtype_name in dtypes:
+        dtype = _dtype(dtype_name)
+        elem  = torch.finfo(dtype).bits // 8
+
+        for N, B, D in product(ns, B_vals, D_vals):
+            _, x, Y = _make(B, N, D, dtype, seed=0)
+            v = _make_v(B, N, dtype)
+            cfg_str = f"B={B} N={N} D={D}"
+
+            for phi_type in phi_types:
+                Phi = _PHI_FACTORIES[phi_type](B, N, dtype).contiguous()
+
+                t_tri = triton.testing.do_bench(
+                    lambda: stream_mix_add(Phi, x, Y),
+                    warmup=warmup, rep=rep,
+                )
+                t_eager = triton.testing.do_bench(
+                    lambda: ref_no_proj(Phi, x, Y),
+                    warmup=warmup, rep=rep,
+                )
+                t_comp = triton.testing.do_bench(
+                    lambda: _ref_no_proj_compiled(Phi, x, Y),
+                    warmup=warmup, rep=rep,
+                )
+
+                def _sp(t_ref):
+                    sp = t_ref / t_tri
+                    s = f"{sp:.2f}x"
+                    return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
+
+                if phi_type == "diagonal":
+                    t_diag = triton.testing.do_bench(
+                        lambda: ref_diagonal_add(Phi, x, Y),
+                        warmup=warmup, rep=rep,
+                    )
+                    ratio = t_diag / t_tri
+                    diag_str = f"{t_diag:>13.3f}"
+                    vs_diag = f"{ratio:.2f}x"
+                    vd_col = ok(vs_diag) if ratio >= 1.05 else (
+                        warn(vs_diag) if ratio >= 0.95 else fail(vs_diag)
+                    )
+                else:
+                    diag_str = f"{'N/A':>13}"
+                    vd_col   = f"{'N/A':>8}"
+
+                bw = _bytes_no_proj(B, N, D, elem) / (t_tri * 1e-3) / 1e9
+                label = _PHI_LABEL[phi_type]
+                print(
+                    f"{cfg_str:>24}  {label:>8}  {dtype_name:>6}  "
+                    f"{t_tri:>10.3f}  {t_eager:>9.3f}  {t_comp:>12.3f}  {_sp(t_eager):>8}  "
+                    f"{diag_str}  {vd_col:>8}"
+                )
+
+            print()   # blank line between (N,B,D) groups
+
+        print(_SPSEP)
 
     print()
 
@@ -355,6 +544,7 @@ def main():
 
     if args.mode in ("perf", "all"):
         run_perf(args.n, args.dtype, warmup=args.warmup, rep=args.rep)
+        run_structured_perf(args.n, args.dtype, warmup=args.warmup, rep=args.rep)
 
     if args.mode in ("correctness", "all") and not passed:
         sys.exit(1)

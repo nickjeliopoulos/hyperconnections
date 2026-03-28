@@ -266,14 +266,14 @@ def _stream_mix_bwd_dPhi(
 
 def _make_v_arg(v: torch.Tensor | None, B: int, N: int, device, dtype):
     if v is not None:
-        return v.to(dtype=torch.float32).contiguous()
-    return torch.zeros(B, N, dtype=torch.float32, device=device)
+        return v.contiguous()
+    return torch.zeros(B, N, dtype=dtype, device=device)
 
 
 def _make_bd_arg(t: torch.Tensor | None, B: int, D: int, device):
-    """[B, D] fp32 dummy when t is None; strides are never dereferenced."""
+    """[B, D] dummy when t is None; strides are never dereferenced."""
     if t is not None:
-        return t.to(dtype=torch.float32).contiguous()
+        return t.contiguous()
     return torch.zeros(B, D, dtype=torch.float32, device=device)
 
 
@@ -325,17 +325,16 @@ def _launch_bwd_dPhi(G, x, v, alpha, grad_Phi, N):
 class _StreamMixFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Phi, x, Y, v):
-        Phi_c = Phi.float().contiguous()
-        x_c   = x.float().contiguous()
-        Y_c   = Y.float().contiguous()
-        v_c   = v.float().contiguous() if v is not None else None
+        Phi_c = Phi.contiguous()
+        x_c   = x.contiguous()
+        Y_c   = Y.contiguous()
+        v_c   = v.contiguous() if v is not None else None
 
         out = torch.empty_like(x_c)
         _launch_fwd(Phi_c, x_c, Y_c, v_c, out)
 
         ctx.save_for_backward(Phi_c, x_c, v_c)
-        ctx.orig_dtype = x.dtype
-        return out.to(x.dtype)
+        return out
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -348,12 +347,15 @@ class _StreamMixFn(torch.autograd.Function):
         # ---- shared intermediates (proj only) --------------------------------
         # Computed once in Python; eliminates O(N²) Phi loads from bwd_dx and
         # O(N³) x loads from bwd_dPhi that the previous per-program loops used.
+        # Explicit .float() ensures fp32 precision for Python-side intermediates
+        # regardless of input dtype (fp16 inputs stay fp16 in the Triton kernels,
+        # which do their own .to(tl.float32) on loads).
         alpha = beta = phi_v = c = None
         if use_proj:
-            alpha = torch.einsum("bn,bnd->bd", v, x)                # [B, D]
-            phi_v = torch.bmm(Phi, v.unsqueeze(-1)).squeeze(-1)      # [B, N]
-            c     = v - phi_v                                         # [B, N]
-            beta  = torch.einsum("bnd,bn->bd", G, c)                 # [B, D]
+            alpha = torch.einsum("bn,bnd->bd", v.float(), x.float())            # [B, D]
+            phi_v = torch.bmm(Phi.float(), v.float().unsqueeze(-1)).squeeze(-1) # [B, N]
+            c     = v.float() - phi_v                                            # [B, N]
+            beta  = torch.einsum("bnd,bn->bd", G, c)                            # [B, D]
 
         # ---- grad_x (Triton) -------------------------------------------------
         grad_x = torch.empty_like(x)
@@ -375,14 +377,14 @@ class _StreamMixFn(torch.autograd.Function):
         #   grad_v      = rho_part + beta_part
         grad_v = None
         if use_proj and ctx.needs_input_grad[3]:
-            rho      = (G * alpha.unsqueeze(1)).sum(dim=2)                       # [B, N]
-            rho_part = rho - torch.bmm(Phi.mT, rho.unsqueeze(-1)).squeeze(-1)   # [B, N]
-            beta_part = torch.einsum("bd,bnd->bn", beta, x)                     # [B, N]
-            grad_v   = (rho_part + beta_part).to(v.dtype)
+            rho       = (G * alpha.unsqueeze(1)).sum(dim=2)                             # [B, N]
+            rho_part  = rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1) # [B, N]
+            beta_part = torch.einsum("bd,bnd->bn", beta, x.float())                    # [B, N]
+            grad_v    = (rho_part + beta_part).to(v.dtype)
 
         return (
             grad_Phi.to(Phi.dtype) if ctx.needs_input_grad[0] else None,
-            grad_x.to(ctx.orig_dtype) if ctx.needs_input_grad[1] else None,
+            grad_x if ctx.needs_input_grad[1] else None,
             grad_Y if ctx.needs_input_grad[2] else None,
             grad_v,
         )
