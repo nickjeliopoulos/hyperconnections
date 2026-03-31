@@ -16,9 +16,7 @@ heuristic:
       inner loop is fully unrolled, Phi scalars hit L1, x slices stay in
       the 40 MB A100 L2.  Faster for small N or small B.
 """
-
 from __future__ import annotations
-
 import torch
 
 from hyperconnections.ops.stream_mix import stream_mix_add_small_n
@@ -71,6 +69,3 @@ def stream_mix_add(
     if _use_big_nb(x):
         return stream_mix_add_big_nb(Phi, x, Y, v)
     return stream_mix_add_small_n(Phi, x, Y, v)
-
-
-__all__ = ["stream_mix_add"]

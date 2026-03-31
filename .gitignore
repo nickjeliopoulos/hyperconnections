@@ -30,9 +30,11 @@ Thumbs.db
 
 *.txt
 *.log
+*.lock
 
 # Project-specific
 .claude/
 *.pdf
 snr_analysis.py
 cutile-python/
+ptx_ir_dump/
