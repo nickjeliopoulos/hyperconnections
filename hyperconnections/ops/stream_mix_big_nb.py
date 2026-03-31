@@ -76,6 +76,7 @@ def _stream_mix_fwd_big_nb(
     stride_v_b,   stride_v_n,
     N_STREAMS: tl.constexpr,
     USE_PROJ:  tl.constexpr,
+    DTYPE:     tl.constexpr,
     BLOCK_D:   tl.constexpr,
 ):
     pid_b = tl.program_id(0)
@@ -105,7 +106,7 @@ def _stream_mix_fwd_big_nb(
     x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
 
     # ---- acc = Phi @ x_tile [N, BLOCK_D] via tensor cores ------------------
-    acc = tl.dot(Phi_tile, x_tile, allow_tf32=True)  # [N, BLOCK_D], fp32
+    acc = tl.dot(Phi_tile, x_tile, allow_tf32=False)  # [N, BLOCK_D], fp32
 
     # ---- Optional projection correction ------------------------------------
     if USE_PROJ:
@@ -137,7 +138,7 @@ def _stream_mix_fwd_big_nb(
         + n_idx[:, None] * stride_o_n
         + d_idx[None, :] * stride_o_d
     )
-    tl.store(out_ptrs, acc + Y_tile, mask=d_mask[None, :])
+    tl.store(out_ptrs, (acc + Y_tile).to(DTYPE), mask=d_mask[None, :])
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,7 @@ def _stream_mix_bwd_dx_big_nb(
     stride_gx_b,   stride_gx_n,   stride_gx_d,
     N_STREAMS: tl.constexpr,
     USE_PROJ:  tl.constexpr,
+    DTYPE:     tl.constexpr,
     BLOCK_D:   tl.constexpr,
 ):
     pid_b = tl.program_id(0)
@@ -191,7 +193,7 @@ def _stream_mix_bwd_dx_big_nb(
     G_tile = tl.load(G_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
 
     # ---- grad_x = Phi^T @ G [N, BLOCK_D] -----------------------------------
-    grad_x_tile = tl.dot(Phi_T, G_tile, allow_tf32=True)
+    grad_x_tile = tl.dot(Phi_T, G_tile, allow_tf32=False)
 
     # ---- Optional proj correction: v * beta ---------------------------------
     if USE_PROJ:
@@ -210,7 +212,7 @@ def _stream_mix_bwd_dx_big_nb(
         + n_idx[:, None] * stride_gx_n
         + d_idx[None, :] * stride_gx_d
     )
-    tl.store(gx_ptrs, grad_x_tile, mask=d_mask[None, :])
+    tl.store(gx_ptrs, grad_x_tile.to(DTYPE), mask=d_mask[None, :])
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +282,7 @@ def _stream_mix_bwd_dPhi_big_nb(
             x_eff = x_tile
 
         # [N, BLOCK_D] @ [BLOCK_D, N] → [N, N], fused into accumulator
-        acc = tl.dot(G_tile, tl.trans(x_eff), acc=acc, allow_tf32=True)
+        acc = tl.dot(G_tile, tl.trans(x_eff), acc=acc, allow_tf32=False)
 
     # ---- Store grad_Phi[b] --------------------------------------------------
     gP_ptrs = (
@@ -312,30 +314,39 @@ def _make_bd_arg(t: torch.Tensor | None, B: int, D: int, device):
 # Launch wrappers
 # ---------------------------------------------------------------------------
 
+_TORCH_TO_TL_DTYPE = {
+    torch.float16:  tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32:  tl.float32,
+}
+
+
 def _launch_fwd(Phi, x, Y, v, out):
-    B, N, D = x.shape
+    B, N, D  = x.shape
     use_proj = v is not None
     v_arg    = _make_v_arg(v, B, N, x.device, x.dtype)
+    tl_dtype = _TORCH_TO_TL_DTYPE[x.dtype]
     grid = lambda meta: (B, triton.cdiv(D, meta["BLOCK_D"]))
     _stream_mix_fwd_big_nb[grid](
         Phi, x, Y, out, v_arg,
         D,
         *Phi.stride(), *x.stride(), *Y.stride(), *out.stride(), *v_arg.stride(),
-        N_STREAMS=N, USE_PROJ=use_proj,
+        N_STREAMS=N, USE_PROJ=use_proj, DTYPE=tl_dtype,
     )
 
 
-def _launch_bwd_dx(G, Phi, v, beta, grad_x, N):
-    B, _, D = G.shape
+def _launch_bwd_dx(G, Phi, v, beta, grad_x, N, out_dtype):
+    B, _, D  = G.shape
     use_proj = v is not None
     v_arg    = _make_v_arg(v, B, N, G.device, G.dtype)
     beta_arg = _make_bd_arg(beta, B, D, G.device)
+    tl_dtype = _TORCH_TO_TL_DTYPE[out_dtype]
     grid = lambda meta: (B, triton.cdiv(D, meta["BLOCK_D"]))
     _stream_mix_bwd_dx_big_nb[grid](
         G, Phi, v_arg, beta_arg, grad_x,
         D,
         *G.stride(), *Phi.stride(), *v_arg.stride(), *beta_arg.stride(), *grad_x.stride(),
-        N_STREAMS=N, USE_PROJ=use_proj,
+        N_STREAMS=N, USE_PROJ=use_proj, DTYPE=tl_dtype,
     )
 
 
@@ -389,7 +400,7 @@ class _StreamMixBigNBFn(torch.autograd.Function):
 
         # ---- grad_x (Triton) ------------------------------------------------
         grad_x = torch.empty_like(x)
-        _launch_bwd_dx(G, Phi, v, beta, grad_x, N)
+        _launch_bwd_dx(G, Phi, v, beta, grad_x, N, out_dtype=x.dtype)
 
         # ---- grad_Phi (Triton) ----------------------------------------------
         grad_Phi = torch.empty(B, N, N, dtype=torch.float32, device=x.device)

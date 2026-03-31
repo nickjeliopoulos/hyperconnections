@@ -34,13 +34,12 @@ import triton.testing
 
 from hyperconnections.ops import stream_mix_add
 
-torch.set_float32_matmul_precision("high")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-DEVICE = "cuda"
+DEVICE = "cuda:0"
 
 _RESET  = "\033[0m"
 _GREEN  = "\033[92m"
