@@ -533,19 +533,19 @@ def main():
         help="Which sections to run (default: all)",
     )
     parser.add_argument(
-        "--n", type=int, nargs="+", default=[4, 8, 16],
+        "--n", type=int, nargs="+", default=[4],
         metavar="N", help="N_STREAMS values to benchmark (default: 4 8 16)",
     )
     parser.add_argument(
-        "--m", type=int, nargs="+", default=[1, 4],
+        "--m", type=int, nargs="+", default=[1],
         metavar="M", help="m values (modules per HC layer, default: 1 4)",
     )
     parser.add_argument(
-        "--b", type=int, nargs="+", default=[64, 512, 2048],
+        "--b", type=int, nargs="+", default=[1024],
         metavar="B", help="batch size values, shared across correctness and perf (default: 64 512 2048)",
     )
     parser.add_argument(
-        "--embed_dim", type=int, nargs="+", default=[128, 256, 512],
+        "--embed_dim", type=int, nargs="+", default=[1024],
         metavar="E",
         help="embed_dim values; D = embed_dim // m (default: 128 256 512)",
     )
