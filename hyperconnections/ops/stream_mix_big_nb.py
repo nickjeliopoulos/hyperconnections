@@ -6,10 +6,11 @@ in a single CTA, which amortises the cost of loading Phi[b] and x[b, :, d_tile]
 from global memory instead of relying on L2 reuse across N separate CTAs.
 
 This variant should only be dispatched when:
-  N >= 16  and  N % 16 == 0  and  B*N*D*elem_bytes > 40 MB
+  N >= 16  and  N % 16 == 0  and  B*N*D*elem_bytes > 0.75 * 40 MB
 
 Below that footprint the L2 cache absorbs the cross-CTA x reuse for free,
-and the generic kernel (stream_mix.py) is faster due to static-range unrolling.
+and the generic kernel (stream_mix_small_nb.py) is faster due to static-range
+unrolling.
 
 Kernel layout
 ─────────────
@@ -25,6 +26,12 @@ Kernel layout
       v (loop-invariant) is loaded once before the loop.
       alpha ([B,D]) is loaded per tile.
 
+Precision note
+──────────────
+  All tl.dot calls use allow_tf32=False.  With fp32 inputs (all tensors are
+  upcasted before the dot), TF32 would round each mantissa from 23 bits to 10,
+  silently degrading gradient precision.  allow_tf32=False forces full fp32 FMAs.
+
 Backward shared intermediates (proj case, precomputed in Python):
   alpha  [B, D]  = v^T x          (removes O(N²) Phi loads from bwd_dx)
   phi_v  [B, N]  = Phi @ v
@@ -38,11 +45,10 @@ import torch
 import triton
 import triton.language as tl
 
-# ---------------------------------------------------------------------------
-# Autotune configs
-# BLOCK_D must be a power-of-2 ≥ 16 for tl.dot on Ampere (sm_80).
-# ---------------------------------------------------------------------------
-
+###
+### Autotune configs
+### BLOCK_D must be a power-of-2 ≥ 16 for tl.dot on Ampere (sm_80).
+###
 _BIG_NB_FWD_CONFIGS = [
     triton.Config({"BLOCK_D": 32},  num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
@@ -60,10 +66,9 @@ _BIG_NB_DPHI_CONFIGS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Forward kernel
-# ---------------------------------------------------------------------------
-
+###
+### Forward kernel
+###
 @triton.autotune(configs=_BIG_NB_FWD_CONFIGS, key=["D", "N_STREAMS"])
 @triton.jit
 def _stream_mix_fwd_big_nb(
@@ -87,7 +92,7 @@ def _stream_mix_fwd_big_nb(
     d_mask = d_idx < D
     n_idx  = tl.arange(0, N_STREAMS)
 
-    # ---- Load Phi[b]: [N, N] ------------------------------------------------
+    ### Load Phi[b]: [N, N]
     phi_ptrs = (
         Phi_ptr
         + pid_b * stride_phi_b
@@ -96,7 +101,7 @@ def _stream_mix_fwd_big_nb(
     )
     Phi_tile = tl.load(phi_ptrs).to(tl.float32)  # [N, N]
 
-    # ---- Load x[b, :, d_tile]: [N, BLOCK_D] --------------------------------
+    ### Load x[b, :, d_tile]: [N, BLOCK_D]
     x_ptrs = (
         x_ptr
         + pid_b * stride_x_b
@@ -105,10 +110,10 @@ def _stream_mix_fwd_big_nb(
     )
     x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
 
-    # ---- acc = Phi @ x_tile [N, BLOCK_D] via tensor cores ------------------
+    ### acc = Phi @ x_tile [N, BLOCK_D] via tensor cores
     acc = tl.dot(Phi_tile, x_tile, allow_tf32=False)  # [N, BLOCK_D], fp32
 
-    # ---- Optional projection correction ------------------------------------
+    ### Optional projection correction
     if USE_PROJ:
         v_ptrs = v_ptr + pid_b * stride_v_b + n_idx * stride_v_n
         v_tile = tl.load(v_ptrs).to(tl.float32)                       # [N]
@@ -122,7 +127,7 @@ def _stream_mix_fwd_big_nb(
         # correction = (v - phi_v) * alpha  [N, BLOCK_D]
         acc = acc + (v_tile - phi_v)[:, None] * alpha[None, :]
 
-    # ---- Add Y[b, :, d_tile] -----------------------------------------------
+    ### Add Y[b, :, d_tile]
     Y_ptrs = (
         Y_ptr
         + pid_b * stride_y_b
@@ -131,7 +136,7 @@ def _stream_mix_fwd_big_nb(
     )
     Y_tile = tl.load(Y_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
 
-    # ---- Store output -------------------------------------------------------
+    ### Store output
     out_ptrs = (
         out_ptr
         + pid_b * stride_o_b
@@ -141,15 +146,14 @@ def _stream_mix_fwd_big_nb(
     tl.store(out_ptrs, (acc + Y_tile).to(DTYPE), mask=d_mask[None, :])
 
 
-# ---------------------------------------------------------------------------
-# Backward kernel: grad_x
-#
-# no-proj:  grad_x[b, :, d] = Phi^T @ G[b, :, d]
-# proj:     grad_x[b, :, d] = Phi^T @ G[b, :, d]  +  v * beta[b, d]
-#
-# beta precomputed in Python — single load per d_tile, no nested N loop.
-# ---------------------------------------------------------------------------
-
+###
+### Backward kernel: grad_x
+###
+### no-proj:  grad_x[b, :, d] = Phi^T @ G[b, :, d]
+### proj:     grad_x[b, :, d] = Phi^T @ G[b, :, d]  +  v * beta[b, d]
+###
+### beta precomputed in Python — single load per d_tile, no nested N loop.
+###
 @triton.autotune(configs=_BIG_NB_FWD_CONFIGS, key=["D", "N_STREAMS"])
 @triton.jit
 def _stream_mix_bwd_dx_big_nb(
@@ -173,7 +177,7 @@ def _stream_mix_bwd_dx_big_nb(
     d_mask = d_idx < D
     n_idx  = tl.arange(0, N_STREAMS)
 
-    # ---- Load Phi[b]^T: [N, N] (load then transpose) -----------------------
+    ### Load Phi[b]^T: [N, N] (load then transpose)
     phi_ptrs = (
         Phi_ptr
         + pid_b * stride_phi_b
@@ -183,7 +187,7 @@ def _stream_mix_bwd_dx_big_nb(
     Phi_tile = tl.load(phi_ptrs).to(tl.float32)   # [N, N]
     Phi_T    = tl.trans(Phi_tile)                  # [N, N] transposed
 
-    # ---- Load G[b, :, d_tile]: [N, BLOCK_D] --------------------------------
+    ### Load G[b, :, d_tile]: [N, BLOCK_D]
     G_ptrs = (
         G_ptr
         + pid_b * stride_g_b
@@ -192,10 +196,10 @@ def _stream_mix_bwd_dx_big_nb(
     )
     G_tile = tl.load(G_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
 
-    # ---- grad_x = Phi^T @ G [N, BLOCK_D] -----------------------------------
+    ### grad_x = Phi^T @ G [N, BLOCK_D]
     grad_x_tile = tl.dot(Phi_T, G_tile, allow_tf32=False)
 
-    # ---- Optional proj correction: v * beta ---------------------------------
+    ### Optional proj correction: v * beta
     if USE_PROJ:
         v_ptrs = v_ptr + pid_b * stride_v_b + n_idx * stride_v_n
         v_tile = tl.load(v_ptrs).to(tl.float32)                       # [N]
@@ -205,7 +209,7 @@ def _stream_mix_bwd_dx_big_nb(
 
         grad_x_tile = grad_x_tile + v_tile[:, None] * beta_vec[None, :]
 
-    # ---- Store grad_x -------------------------------------------------------
+    ### Store grad_x
     gx_ptrs = (
         grad_x_ptr
         + pid_b * stride_gx_b
@@ -215,18 +219,17 @@ def _stream_mix_bwd_dx_big_nb(
     tl.store(gx_ptrs, grad_x_tile.to(DTYPE), mask=d_mask[None, :])
 
 
-# ---------------------------------------------------------------------------
-# Backward kernel: grad_Phi
-#
-# grad_Phi[b] = Σ_{d-tiles}  G_tile  @  x_eff_tile^T    [N, BLOCK_D] @ [BLOCK_D, N]
-#
-# no-proj:  x_eff = x
-# proj:     x_eff[b, n, d] = x[b, n, d] - v[b, n] * alpha[b, d]
-#
-# v is [N], loop-invariant → loaded once before the D loop.
-# alpha is [B, D]          → loaded per d_tile inside the loop.
-# ---------------------------------------------------------------------------
-
+###
+### Backward kernel: grad_Phi
+###
+### grad_Phi[b] = Σ_{d-tiles}  G_tile  @  x_eff_tile^T    [N, BLOCK_D] @ [BLOCK_D, N]
+###
+### no-proj:  x_eff = x
+### proj:     x_eff[b, n, d] = x[b, n, d] - v[b, n] * alpha[b, d]
+###
+### v is [N], loop-invariant → loaded once before the D loop.
+### alpha is [B, D]          → loaded per d_tile inside the loop.
+###
 @triton.autotune(configs=_BIG_NB_DPHI_CONFIGS, key=["D", "N_STREAMS"])
 @triton.jit
 def _stream_mix_bwd_dPhi_big_nb(
@@ -284,7 +287,7 @@ def _stream_mix_bwd_dPhi_big_nb(
         # [N, BLOCK_D] @ [BLOCK_D, N] → [N, N], fused into accumulator
         acc = tl.dot(G_tile, tl.trans(x_eff), acc=acc, allow_tf32=False)
 
-    # ---- Store grad_Phi[b] --------------------------------------------------
+    ### Store grad_Phi[b]
     gP_ptrs = (
         grad_Phi_ptr
         + pid_b * stride_gP_b
@@ -294,10 +297,9 @@ def _stream_mix_bwd_dPhi_big_nb(
     tl.store(gP_ptrs, acc)
 
 
-# ---------------------------------------------------------------------------
-# Python helpers (mirrored from stream_mix.py to keep this file self-contained)
-# ---------------------------------------------------------------------------
-
+###
+### Python helpers
+###
 def _make_v_arg(v: torch.Tensor | None, B: int, N: int, device, dtype):
     if v is not None:
         return v.contiguous()
@@ -310,10 +312,9 @@ def _make_bd_arg(t: torch.Tensor | None, B: int, D: int, device):
     return torch.zeros(B, D, dtype=torch.float32, device=device)
 
 
-# ---------------------------------------------------------------------------
-# Launch wrappers
-# ---------------------------------------------------------------------------
-
+###
+### Launch wrappers
+###
 _TORCH_TO_TL_DTYPE = {
     torch.float16:  tl.float16,
     torch.bfloat16: tl.bfloat16,
@@ -364,10 +365,9 @@ def _launch_bwd_dPhi(G, x, v, alpha, grad_Phi, N):
     )
 
 
-# ---------------------------------------------------------------------------
-# Autograd Function
-# ---------------------------------------------------------------------------
-
+###
+### Autograd Function
+###
 class _StreamMixBigNBFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Phi, x, Y, v):
@@ -390,7 +390,7 @@ class _StreamMixBigNBFn(torch.autograd.Function):
 
         G = grad_out.float().contiguous()
 
-        # ---- Shared intermediates (proj only) --------------------------------
+        ### Shared intermediates (proj only)
         alpha = beta = phi_v = c = None
         if use_proj:
             alpha = torch.einsum("bn,bnd->bd", v.float(), x.float())             # [B, D]
@@ -398,18 +398,18 @@ class _StreamMixBigNBFn(torch.autograd.Function):
             c     = v.float() - phi_v                                             # [B, N]
             beta  = torch.einsum("bnd,bn->bd", G, c)                             # [B, D]
 
-        # ---- grad_x (Triton) ------------------------------------------------
+        ### grad_x (Triton)
         grad_x = torch.empty_like(x)
         _launch_bwd_dx(G, Phi, v, beta, grad_x, N, out_dtype=x.dtype)
 
-        # ---- grad_Phi (Triton) ----------------------------------------------
+        ### grad_Phi (Triton)
         grad_Phi = torch.empty(B, N, N, dtype=torch.float32, device=x.device)
         _launch_bwd_dPhi(G, x, v, alpha, grad_Phi, N)
 
-        # ---- grad_Y = grad_out (identity) -----------------------------------
+        ### grad_Y = grad_out (identity)
         grad_Y = grad_out
 
-        # ---- grad_v (PyTorch) -----------------------------------------------
+        ### grad_v (PyTorch)
         grad_v = None
         if use_proj and ctx.needs_input_grad[3]:
             rho       = (G * alpha.unsqueeze(1)).sum(dim=2)
@@ -425,10 +425,9 @@ class _StreamMixBigNBFn(torch.autograd.Function):
         )
 
 
-# ---------------------------------------------------------------------------
-# Public API (used by the dispatcher in ops/__init__.py)
-# ---------------------------------------------------------------------------
-
+###
+### Public API
+###
 def stream_mix_add_big_nb(
     Phi: torch.Tensor,
     x: torch.Tensor,
@@ -444,7 +443,7 @@ def stream_mix_add_big_nb(
     Preconditions (checked by the dispatcher):
       - x.is_cuda
       - N >= 16 and N % 16 == 0
-      - B * N * D * elem_bytes > 40 MB
+      - B * N * D * elem_bytes > 0.75 * 40 MB
     """
     B, N, D = x.shape
     return _StreamMixBigNBFn.apply(Phi, x, Y, v)

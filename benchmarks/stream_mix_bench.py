@@ -35,9 +35,9 @@ import triton.testing
 from hyperconnections.ops import stream_mix_add
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+###
+### Helpers
+###
 
 DEVICE = "cuda:0"
 
@@ -86,9 +86,9 @@ def _make_v(B, N, dtype, seed=7):
     return torch.nn.functional.normalize(v, dim=-1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Structured Phi factories
-# ──────────────────────────────────────────────────────────────────────────────
+###
+### Structured Phi factories
+###
 
 def _make_skew_phi(B: int, N: int, dtype: torch.dtype, seed: int = 1) -> torch.Tensor:
     """Skew-symmetric: Phi = M - M^T  (Phi^T = -Phi)."""
@@ -127,9 +127,9 @@ _PHI_LABEL = {
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Reference implementations
-# ──────────────────────────────────────────────────────────────────────────────
+###
+### Reference implementations
+###
 
 def ref_no_proj(Phi, x, Y):
     return torch.bmm(Phi, x) + Y
@@ -171,9 +171,9 @@ def ref_no_proj_backward(Phi, x, Y):
     return Phi_r.grad, x_r.grad, Y_r.grad
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Correctness checks
-# ──────────────────────────────────────────────────────────────────────────────
+###
+### Correctness checks
+###
 
 def _check(label: str, got: torch.Tensor, ref: torch.Tensor, atol: float) -> tuple[bool, float]:
     diff = (got.float() - ref.float()).abs()
@@ -195,14 +195,14 @@ def _corr_row(config, variant, check, max_err, atol, passed):
 def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
     """Run fwd+bwd correctness for one (Phi, x, Y, v) combo; return updated all_passed."""
 
-    # ---- forward no-proj ----
+    ### forward no-proj
     got = stream_mix_add(Phi, x, Y)
     ref = ref_no_proj(Phi.float(), x.float(), Y.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
     all_passed &= passed
     print(_corr_row(cfg_str, "no-proj", "fwd", err, atol_f, passed))
 
-    # ---- forward proj ----
+    ### forward proj
     got = stream_mix_add(Phi, x, Y, v=v)
     ref = ref_proj(Phi.float(), x.float(), Y.float(), v.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
@@ -211,7 +211,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
 
     # backward only for fp32 (avoids casting complexity in reference)
     if dtype == torch.float32:
-        # ---- backward no-proj ----
+        ### backward no-proj
         Phi_t = Phi.detach().requires_grad_(True)
         x_t   = x.detach().requires_grad_(True)
         Y_t   = Y.detach().requires_grad_(True)
@@ -227,7 +227,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
             all_passed &= passed
             print(_corr_row(cfg_str, "no-proj", name, err, atol_b, passed))
 
-        # ---- backward proj ----
+        ### backward proj
         Phi_t = Phi.detach().requires_grad_(True)
         x_t   = x.detach().requires_grad_(True)
         Y_t   = Y.detach().requires_grad_(True)
@@ -287,7 +287,7 @@ def run_correctness(
 
         print(_CORR_SEP)
 
-    # ── Structured Phi correctness ───────────────────────────────────────────
+    ### Structured Phi correctness
     # Focused config set to keep the table concise.
     print()
     print(bold("=" * 90))
@@ -322,9 +322,9 @@ def run_correctness(
     return all_passed
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Performance benchmark
-# ──────────────────────────────────────────────────────────────────────────────
+###
+### Performance benchmark
+###
 
 def _bytes_no_proj(B, N, D, elem_bytes):
     """Bytes touched in the ideal (no data reuse) model: read Phi, x, Y; write out."""
@@ -385,7 +385,7 @@ def run_perf(
             v = _make_v(B, N, dtype)
             cfg_str = f"B={B} N={N} m={m} D={D}"
 
-            # ---- no-proj ----
+            ### no-proj
             t_tri = triton.testing.do_bench(
                 lambda: stream_mix_add(Phi, x, Y),
                 warmup=warmup, rep=rep,
@@ -401,7 +401,7 @@ def run_perf(
             bw = _bytes_no_proj(B, N, D, elem) / (t_tri * 1e-3) / 1e9
             print(_perf_row(cfg_str, "no-proj", dtype_name, t_tri, t_eager, t_compiled, bw))
 
-            # ---- proj ----
+            ### proj
             t_tri_p = triton.testing.do_bench(
                 lambda: stream_mix_add(Phi, x, Y, v=v),
                 warmup=warmup, rep=rep,
@@ -422,9 +422,9 @@ def run_perf(
     print()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Structured-matrix performance benchmark
-# ──────────────────────────────────────────────────────────────────────────────
+###
+### Structured-matrix performance benchmark
+###
 
 _SPHDR = (
     f"{'Config':>24}  {'PhiType':>8}  {'dtype':>6}  "
@@ -521,9 +521,9 @@ def run_structured_perf(
     print()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
+###
+### Entry point
+###
 
 def main():
     parser = argparse.ArgumentParser(description="stream_mix_add benchmark")
