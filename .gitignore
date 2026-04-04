@@ -38,3 +38,6 @@ Thumbs.db
 snr_analysis.py
 cutile-python/
 ptx_ir_dump/
+
+# Exceptions
+!benchmark_small_n_exhaustive_4_3_2026.log
