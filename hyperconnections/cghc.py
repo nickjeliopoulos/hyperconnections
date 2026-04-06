@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
 
+from hyperconnections.ops import stream_mix_add
+
 
 @dataclass
 class ContinuousHCConfig:
@@ -46,6 +48,7 @@ class ContinuousGenHyperConnections(nn.Module):
         dt_max: float = 1.0,
         bias: bool = False,
         elementwise_affine: bool = False,
+        use_triton: bool = True,
     ):
         super().__init__()
         self.n = n
@@ -111,7 +114,11 @@ class ContinuousGenHyperConnections(nn.Module):
 
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
         self.module = module
+        self._stream_mix = (
+            self._stream_mix_triton if use_triton else self._stream_mix_eager
+        )
         self.init_weights()
+
 
     def init_weights(self):
         # read_in: σ(bias) = 1/n  →  bias = log(1/(n-1))
@@ -146,6 +153,7 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.zeros_(self.projection_dir.weight)
             nn.init.ones_(self.projection_dir.bias)
 
+
     def compute_generator(self, x: torch.Tensor) -> torch.Tensor:
         """Return A of shape [B, n, n].
 
@@ -173,10 +181,12 @@ class ContinuousGenHyperConnections(nn.Module):
 
         return A
 
+
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
         """Return Phi = exp(dt * A), shape [B, n, n]."""
         dt = torch.clamp(self.log_dt.exp(), self.dt_min, self.dt_max)
         return torch.linalg.matrix_exp(dt * self.compute_generator(x))
+
 
     def compute_read_write_weights(self, x: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state."""
@@ -196,6 +206,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         return write_out, read_in
     
+
     def compute_projection(self, x: torch.Tensor):
         if self.projection == "mean":
             return self.projection_dir.unsqueeze(0)  # [1, n]
@@ -206,6 +217,33 @@ class ContinuousGenHyperConnections(nn.Module):
             return F.normalize(v, dim=-1)  # [B, n], unit norm
         else:
             return None
+
+
+    def _stream_mix_triton(
+        self,
+        x: torch.Tensor,
+        Phi: torch.Tensor,
+        Y: torch.Tensor,
+        v: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if v is not None:
+            v = v.expand(x.shape[0], -1)  # [1, N] ("mean" mode) → [B, N]
+        return stream_mix_add(Phi, x, Y, v)
+
+
+    def _stream_mix_eager(
+        self,
+        x: torch.Tensor,
+        Phi: torch.Tensor,
+        Y: torch.Tensor,
+        v: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if v is None:
+            return einsum(Phi, x, "b n1 n2, b n2 d -> b n1 d") + Y
+        proj = einsum(v, v, "b n1, b n2 -> b n1 n2")
+        orth = torch.eye(self.n, device=x.device, dtype=x.dtype) - proj
+        return einsum(proj + Phi @ orth, x, "b n1 n2, b n2 d -> b n1 d") + Y
+
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         # x: [B, *, input_dim]
@@ -228,23 +266,10 @@ class ContinuousGenHyperConnections(nn.Module):
         out = out.reshape(B, self.m, self.block_size)
         Y = einsum(write_out, out, "b n m, b m d -> b n d")  # [B*, n, block_size]
 
-        ### Steam Mixing
-        # Mixing: X_new_mix = Phi @ X  (or protected variant)
-        transition_matrix = self.compute_transition(x)  # [B, n, n]
-        transition_matrix = transition_matrix.to(x.dtype)
+        ### Stream Mixing
+        Phi = self.compute_transition(x).to(x.dtype)  # [B, n, n]
+        v   = self.compute_projection(x)               # [B, n], [1, n], or None
+        if v is not None:
+            v = v.to(x.dtype)
 
-        # compute projection direction for projected mixing
-        projection_dir = self.compute_projection(x) # [B, n] or None
-        if projection_dir is not None:
-            projection_dir = projection_dir.to(x.dtype)
-
-        if projection_dir is None:
-            x_mixed = einsum(transition_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
-        else:
-            proj_matrix = einsum(projection_dir, projection_dir, "b n1, b n2 -> b n1 n2")  # [b, n, n]
-            orthogonal_proj = torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix  # [b, n, n]
-            x_proj = einsum(proj_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [b, n, block_size]
-            x_orth = einsum(orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d")  # [b, n, block_size]
-            x_mixed = x_proj + einsum(transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
-
-        return (x_mixed + Y).unflatten(0, leading).flatten(-2)
+        return self._stream_mix(x, Phi, Y, v).unflatten(0, leading).flatten(-2)
