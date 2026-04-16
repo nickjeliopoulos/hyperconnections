@@ -267,9 +267,9 @@ class ContinuousGenHyperConnections(nn.Module):
         Y = einsum(write_out, out, "b n m, b m d -> b n d")  # [B*, n, block_size]
 
         ### Stream Mixing
-        Phi = self.compute_transition(x).to(x.dtype)  # [B, n, n]
-        v   = self.compute_projection(x)               # [B, n], [1, n], or None
+        transition_matrix = self.compute_transition(x).to(x.dtype)  # [B, n, n]
+        v                 = self.compute_projection(x)               # [B, n], [1, n], or None
         if v is not None:
             v = v.to(x.dtype)
 
-        return self._stream_mix(x, Phi, Y, v).unflatten(0, leading).flatten(-2)
+        return self._stream_mix(x, transition_matrix, Y, v).unflatten(0, leading).flatten(-2)
